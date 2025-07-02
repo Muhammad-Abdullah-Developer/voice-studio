@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Text-to-Speech and Voice Cloning Web Application
-A comprehensive TTS tool with voice upload and multilingual support
+A comprehensive TTS tool with ElevenLabs and multilingual support
 """
 
 from flask import Flask, render_template_string, request, send_file, jsonify, flash, redirect, url_for
@@ -9,7 +9,6 @@ import os
 import tempfile
 import uuid
 from werkzeug.utils import secure_filename
-from gtts import gTTS
 import speech_recognition as sr
 from pydub import AudioSegment
 import io
@@ -18,6 +17,12 @@ import threading
 import time
 from datetime import datetime
 import platform
+import requests
+import json
+
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-change-this'
@@ -32,7 +37,11 @@ for folder in [UPLOAD_FOLDER, OUTPUT_FOLDER]:
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
 app.config['OUTPUT_FOLDER'] = OUTPUT_FOLDER
 
-# Supported languages for gTTS
+# ElevenLabs Configuration
+ELEVENLABS_API_KEY = os.getenv('ELEVENLABS_API_KEY')
+ELEVENLABS_API_URL = "https://api.elevenlabs.io/v1"
+
+# Supported languages for different engines
 SUPPORTED_LANGUAGES = {
     'en': 'English',
     'es': 'Spanish', 
@@ -64,90 +73,143 @@ ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'm4a', 'flac'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
-# Check if running on cloud platform
-IS_CLOUD_DEPLOYMENT = os.environ.get('RENDER') or os.environ.get('HEROKU') or platform.system() == 'Linux'
 
-# Conditional import for pyttsx3
-try:
-    if not IS_CLOUD_DEPLOYMENT:
-        import pyttsx3
-        PYTTSX_AVAILABLE = True
-    else:
-        PYTTSX_AVAILABLE = False
-        print("Running on cloud platform - pyttsx3 disabled, using Google TTS only")
-except ImportError:
-    PYTTSX_AVAILABLE = False
-    print("pyttsx3 not available - using Google TTS only")
+class ElevenLabsAPI:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = ELEVENLABS_API_URL
+        self.headers = {
+            "Accept": "audio/mpeg",
+            "Content-Type": "application/json",
+            "xi-api-key": api_key
+        }
+    
+    def get_voices(self):
+        """Get available ElevenLabs voices"""
+        try:
+            if not self.api_key:
+                return []
+            
+            response = requests.get(f"{self.base_url}/voices", 
+                                  headers={"xi-api-key": self.api_key})
+            
+            if response.status_code == 200:
+                voices_data = response.json()
+                voices = []
+                for voice in voices_data.get('voices', []):
+                    voices.append({
+                        'id': voice['voice_id'],
+                        'name': voice['name'],
+                        'category': voice.get('category', 'Unknown'),
+                        'description': voice.get('description', ''),
+                        'preview_url': voice.get('preview_url', ''),
+                        'labels': voice.get('labels', {})
+                    })
+                return voices
+            else:
+                print(f"Error fetching ElevenLabs voices: {response.status_code}")
+                return []
+        except Exception as e:
+            print(f"Error in get_voices: {e}")
+            return []
+    
+    def text_to_speech(self, text, voice_id, stability=0.5, similarity_boost=0.5, style=0.0):
+        """Generate speech using ElevenLabs API"""
+        try:
+            if not self.api_key:
+                raise Exception("ElevenLabs API key not provided")
+            
+            url = f"{self.base_url}/text-to-speech/{voice_id}"
+            
+            data = {
+                "text": text,
+                "model_id": "eleven_multilingual_v2",  # Supports multiple languages
+                "voice_settings": {
+                    "stability": stability,
+                    "similarity_boost": similarity_boost,
+                    "style": style,
+                    "use_speaker_boost": True
+                }
+            }
+            
+            response = requests.post(url, json=data, headers=self.headers)
+            
+            if response.status_code == 200:
+                # Save audio file
+                filename = f"elevenlabs_{uuid.uuid4().hex[:8]}.mp3"
+                filepath = os.path.join(app.config['OUTPUT_FOLDER'], filename)
+                
+                with open(filepath, 'wb') as f:
+                    f.write(response.content)
+                
+                return filepath
+            else:
+                error_msg = f"ElevenLabs API error: {response.status_code}"
+                try:
+                    error_data = response.json()
+                    error_msg += f" - {error_data.get('detail', {}).get('message', 'Unknown error')}"
+                except:
+                    pass
+                raise Exception(error_msg)
+                
+        except Exception as e:
+            print(f"Error in ElevenLabs TTS: {e}")
+            return None
+    
+    def clone_voice(self, audio_file_path, voice_name, description="Custom cloned voice"):
+        """Clone a voice from audio sample"""
+        try:
+            if not self.api_key:
+                raise Exception("ElevenLabs API key not provided")
+            
+            url = f"{self.base_url}/voices/add"
+            
+            # Read audio file
+            with open(audio_file_path, 'rb') as f:
+                audio_data = f.read()
+            
+            files = {
+                'files': ('sample.mp3', audio_data, 'audio/mpeg')
+            }
+            
+            data = {
+                'name': voice_name,
+                'description': description,
+                'labels': json.dumps({"custom": "true"})
+            }
+            
+            headers = {"xi-api-key": self.api_key}
+            
+            response = requests.post(url, files=files, data=data, headers=headers)
+            
+            if response.status_code == 200:
+                result = response.json()
+                return result.get('voice_id')
+            else:
+                error_msg = f"Voice cloning error: {response.status_code}"
+                try:
+                    error_data = response.json()
+                    error_msg += f" - {error_data.get('detail', {}).get('message', 'Unknown error')}"
+                except:
+                    pass
+                raise Exception(error_msg)
+                
+        except Exception as e:
+            print(f"Error in voice cloning: {e}")
+            return None
 
 class TTSEngine:
     def __init__(self):
-        if PYTTSX_AVAILABLE:
-            try:
-                self.pyttsx_engine = pyttsx3.init()
-            except:
-                self.pyttsx_engine = None
-                print("Failed to initialize pyttsx3 engine")
-        else:
-            self.pyttsx_engine = None
+        self.elevenlabs = ElevenLabsAPI(ELEVENLABS_API_KEY)
         self.custom_voices = {}
         
-    def get_system_voices(self):
-        """Get available system voices"""
-        if not PYTTSX_AVAILABLE or not self.pyttsx_engine:
-            return [{'id': 0, 'name': 'Cloud TTS Only', 'lang': 'multiple'}]
-        
-        try:
-            voices = self.pyttsx_engine.getProperty('voices')
-            voice_list = []
-            for i, voice in enumerate(voices):
-                voice_list.append({
-                    'id': i,
-                    'name': voice.name,
-                    'lang': getattr(voice, 'lang', 'unknown')
-                })
-            return voice_list
-        except:
-            return [{'id': 0, 'name': 'System TTS Unavailable', 'lang': 'error'}]
+    def get_elevenlabs_voices(self):
+        """Get available ElevenLabs voices"""
+        return self.elevenlabs.get_voices()
     
-    def text_to_speech_pyttsx(self, text, voice_id=None, rate=200, volume=0.9):
-        """Generate speech using pyttsx3 - fallback to gTTS on cloud"""
-        if not PYTTSX_AVAILABLE or not self.pyttsx_engine:
-            # Fallback to Google TTS
-            print("pyttsx3 not available, falling back to Google TTS")
-            return self.text_to_speech_gtts(text, 'en', False)
-        
-        try:
-            if voice_id is not None:
-                voices = self.pyttsx_engine.getProperty('voices')
-                if voice_id < len(voices):
-                    self.pyttsx_engine.setProperty('voice', voices[voice_id].id)
-            
-            self.pyttsx_engine.setProperty('rate', rate)
-            self.pyttsx_engine.setProperty('volume', volume)
-            
-            # Create unique filename
-            filename = f"tts_{uuid.uuid4().hex[:8]}.wav"
-            filepath = os.path.join(app.config['OUTPUT_FOLDER'], filename)
-            
-            self.pyttsx_engine.save_to_file(text, filepath)
-            self.pyttsx_engine.runAndWait()
-            
-            return filepath
-        except Exception as e:
-            print(f"Error in pyttsx TTS: {e}, falling back to Google TTS")
-            return self.text_to_speech_gtts(text, 'en', False)
-        
-    def text_to_speech_gtts(self, text, lang='en', slow=False):
-        """Generate speech using Google TTS"""
-        try:
-            tts = gTTS(text=text, lang=lang, slow=slow)
-            filename = f"gtts_{uuid.uuid4().hex[:8]}.mp3"
-            filepath = os.path.join(app.config['OUTPUT_FOLDER'], filename)
-            tts.save(filepath)
-            return filepath
-        except Exception as e:
-            print(f"Error in gTTS: {e}")
-            return None
+    def text_to_speech_elevenlabs(self, text, voice_id, stability=0.5, similarity_boost=0.5, style=0.0):
+        """Generate speech using ElevenLabs"""
+        return self.elevenlabs.text_to_speech(text, voice_id, stability, similarity_boost, style)
     
     def speech_to_text(self, audio_file_path):
         """Convert speech to text"""
@@ -171,6 +233,10 @@ class TTSEngine:
         except Exception as e:
             print(f"Error in speech recognition: {e}")
             return None
+    
+    def clone_voice_from_audio(self, audio_file_path, voice_name, description=""):
+        """Clone voice using ElevenLabs"""
+        return self.elevenlabs.clone_voice(audio_file_path, voice_name, description)
 
 # Initialize TTS engine
 tts_engine = TTSEngine()
@@ -182,7 +248,7 @@ HTML_TEMPLATE = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Text-to-Speech & Voice Tools</title>
+    <title>Voice Studio - ElevenLabs Edition</title>
     <style>
         * {
             margin: 0;
@@ -216,6 +282,23 @@ HTML_TEMPLATE = """
         .header p {
             font-size: 1.1rem;
             opacity: 0.9;
+        }
+        
+        .api-status {
+            margin-top: 15px;
+            padding: 10px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+        }
+        
+        .api-connected {
+            background: rgba(76, 175, 80, 0.2);
+            border: 1px solid rgba(76, 175, 80, 0.5);
+        }
+        
+        .api-disconnected {
+            background: rgba(244, 67, 54, 0.2);
+            border: 1px solid rgba(244, 67, 54, 0.5);
         }
         
         .content {
@@ -333,8 +416,8 @@ HTML_TEMPLATE = """
         }
         
         .upload-area.dragover {
-            background: #e3f2fd;
-            border-color: #2196f3;
+            background: #ffebee;
+            border-color: #e91e63;
         }
         
         .file-info {
@@ -343,24 +426,6 @@ HTML_TEMPLATE = """
             background: #e8f5e8;
             border-radius: 5px;
             display: none;
-        }
-        
-        .alert {
-            padding: 15px;
-            margin: 20px 0;
-            border-radius: 8px;
-        }
-        
-        .alert-success {
-            background: #d4edda;
-            border: 1px solid #c3e6cb;
-            color: #155724;
-        }
-        
-        .alert-error {
-            background: #f8d7da;
-            border: 1px solid #f5c6cb;
-            color: #721c24;
         }
         
         .loading {
@@ -384,31 +449,85 @@ HTML_TEMPLATE = """
             100% { transform: rotate(360deg); }
         }
         
-        .voice-list {
-            max-height: 200px;
+        .voice-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+            gap: 15px;
+            max-height: 400px;
             overflow-y: auto;
-            border: 1px solid #e9ecef;
-            border-radius: 5px;
             padding: 10px;
+            border: 1px solid #e9ecef;
+            border-radius: 8px;
         }
         
-        .voice-item {
-            padding: 8px;
+        .voice-card {
+            padding: 15px;
+            border: 2px solid #e9ecef;
+            border-radius: 8px;
             cursor: pointer;
-            border-radius: 4px;
+            transition: all 0.3s ease;
+            background: white;
         }
         
-        .voice-item:hover {
-            background: #f8f9fa;
+        .voice-card:hover {
+            border-color: #4facfe;
+            transform: translateY(-2px);
         }
         
-        .voice-item.selected {
-            background: #4facfe;
-            color: white;
+        .voice-card.selected {
+            border-color: #4facfe;
+            background: #4facfe26;
+        }
+        
+        .voice-name {
+            font-weight: 600;
+            color: #333;
+            margin-bottom: 5px;
+        }
+        
+        .voice-category {
+            font-size: 0.9rem;
+            color: #666;
+            margin-bottom: 8px;
+        }
+        
+        .voice-description {
+            font-size: 0.8rem;
+            color: #888;
+            line-height: 1.4;
+        }
+        
+        .settings-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr 1fr;
+            gap: 15px;
+            margin-bottom: 20px;
+        }
+        
+        .range-group {
+            text-align: center;
+        }
+        
+        .range-group label {
+            font-size: 0.9rem;
+            margin-bottom: 5px;
+        }
+        
+        .range-value {
+            font-weight: 600;
+            color: #4facfe;
         }
         
         @media (max-width: 768px) {
             .row {
+                grid-template-columns: 1fr;
+            }
+            
+            .settings-row {
+                grid-template-columns: 1fr;
+            }
+            
+            .voice-grid {
                 grid-template-columns: 1fr;
             }
             
@@ -425,67 +544,64 @@ HTML_TEMPLATE = """
 <body>
     <div class="container">
         <div class="header">
-            <h1>Voice Studio</h1>
-            <p>Professional Text-to-Speech & Voice Processing Tools</p>
+            <h1>🎤 Voice Studio</h1>
+            <p>Professional Text-to-Speech with ElevenLabs AI</p>
+            <div class="api-status {% if api_connected %}api-connected{% else %}api-disconnected{% endif %}">
+                {% if api_connected %}
+                    ElevenLabs API Connected - {{ voice_count }} voices available
+                {% else %}
+                    ElevenLabs API Key Required - Add ELEVENLABS_API_KEY to environment
+                {% endif %}
+            </div>
         </div>
         
         <div class="content">
             <div class="tabs">
                 <div class="tab active" onclick="switchTab('tts')">Text to Speech</div>
                 <div class="tab" onclick="switchTab('stt')">Speech to Text</div>
-                <div class="tab" onclick="switchTab('voices')">Voice Management</div>
+                <div class="tab" onclick="switchTab('voices')">Voice Library</div>
             </div>
             
             <!-- Text to Speech Tab -->
             <div id="tts-tab" class="tab-content active">
                 <form id="tts-form" onsubmit="generateSpeech(event)">
-                    <div class="row">
-                        <div>
-                            <div class="form-group">
-                                <label for="text-input">Enter Text to Convert:</label>
-                                <textarea id="text-input" name="text" class="form-control" 
-                                         placeholder="Type your text here..." required></textarea>
+                    <div class="form-group">
+                        <label for="text-input">Enter Text to Convert:</label>
+                        <textarea id="text-input" name="text" class="form-control" 
+                                 placeholder="Type your text here..." required></textarea>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Select Voice:</label>
+                        <div class="voice-grid" id="voice-selection">
+                            {% for voice in elevenlabs_voices %}
+                            <div class="voice-card" onclick="selectVoice('{{ voice.id }}', this)" data-voice-id="{{ voice.id }}">
+                                <div class="voice-name">{{ voice.name }}</div>
+                                <div class="voice-category">{{ voice.category }}</div>
+                                <div class="voice-description">{{ voice.description[:100] }}...</div>
                             </div>
-                            
-                            <div class="form-group">
-                                <label for="language">Language:</label>
-                                <select id="language" name="language" class="form-control">
-                                    {% for code, name in languages.items() %}
-                                    <option value="{{ code }}" {% if code == 'en' %}selected{% endif %}>{{ name }}</option>
-                                    {% endfor %}
-                                </select>
-                            </div>
-                            
-                            <div class="form-group">
-                                <label for="engine">TTS Engine:</label>
-                                <select id="engine" name="engine" class="form-control">
-                                    <option value="gtts">Google TTS (Online)</option>
-                                    <option value="pyttsx">System TTS (Offline)</option>
-                                </select>
-                            </div>
+                            {% endfor %}
+                        </div>
+                        <input type="hidden" id="selected-voice" name="voice_id" required>
+                    </div>
+                    
+                    <div class="settings-row">
+                        <div class="range-group">
+                            <label for="stability">Stability</label>
+                            <input type="range" id="stability" name="stability" min="0" max="1" step="0.1" value="0.5" class="form-control">
+                            <small>Current: <span id="stability-value" class="range-value">0.5</span></small>
                         </div>
                         
-                        <div>
-                            <div class="form-group">
-                                <label for="voice">Voice (System TTS only):</label>
-                                <select id="voice" name="voice" class="form-control">
-                                    {% for voice in system_voices %}
-                                    <option value="{{ voice.id }}">{{ voice.name }}</option>
-                                    {% endfor %}
-                                </select>
-                            </div>
-                            
-                            <div class="form-group">
-                                <label for="rate">Speech Rate:</label>
-                                <input type="range" id="rate" name="rate" min="50" max="300" value="200" class="form-control">
-                                <small>Current: <span id="rate-value">200</span> WPM</small>
-                            </div>
-                            
-                            <div class="form-group">
-                                <label for="volume">Volume:</label>
-                                <input type="range" id="volume" name="volume" min="0" max="1" step="0.1" value="0.9" class="form-control">
-                                <small>Current: <span id="volume-value">90</span>%</small>
-                            </div>
+                        <div class="range-group">
+                            <label for="similarity">Similarity Boost</label>
+                            <input type="range" id="similarity" name="similarity" min="0" max="1" step="0.1" value="0.5" class="form-control">
+                            <small>Current: <span id="similarity-value" class="range-value">0.5</span></small>
+                        </div>
+                        
+                        <div class="range-group">
+                            <label for="style">Style</label>
+                            <input type="range" id="style" name="style" min="0" max="1" step="0.1" value="0.0" class="form-control">
+                            <small>Current: <span id="style-value" class="range-value">0.0</span></small>
                         </div>
                     </div>
                     
@@ -494,7 +610,7 @@ HTML_TEMPLATE = """
                 
                 <div id="tts-loading" class="loading">
                     <div class="spinner"></div>
-                    <p>Generating speech...</p>
+                    <p>Generating speech with ElevenLabs AI...</p>
                 </div>
                 
                 <div id="tts-result" class="audio-player" style="display: none;">
@@ -503,7 +619,7 @@ HTML_TEMPLATE = """
                         Your browser does not support the audio element.
                     </audio>
                     <br>
-                    <a id="download-link" class="btn" style="display: inline-block; margin-top: 10px; text-decoration: none">Download Audio</a>
+                    <a id="download-link" class="btn" style="display: inline-block; margin-top: 10px; text-decoration: none">📥 Download Audio</a>
                 </div>
             </div>
             
@@ -533,31 +649,76 @@ HTML_TEMPLATE = """
                 <div id="stt-result" style="display: none;">
                     <h3>Transcribed Text:</h3>
                     <div id="transcribed-text" style="background: #f8f9fa; padding: 20px; border-radius: 10px; margin-top: 10px;"></div>
-                    <button onclick="copyToClipboard()" class="btn" style="margin-top: 10px;">📋 Copy Text</button>
+                    <button onclick="copyToClipboard()" class="btn" style="margin-top: 10px;">Copy Text</button>
                 </div>
             </div>
             
-            <!-- Voice Management Tab -->
+            <!-- Voice Library Tab -->
             <div id="voices-tab" class="tab-content">
-                <h3>Available System Voices</h3>
-                <div class="voice-list">
-                    {% for voice in system_voices %}
-                    <div class="voice-item" onclick="testVoice({{ voice.id }})">
-                        <strong>{{ voice.name }}</strong><br>
-                        <small>Language: {{ voice.lang }}</small>
+                <h3>ElevenLabs Voice Library</h3>
+                <div class="voice-grid">
+                    {% for voice in elevenlabs_voices %}
+                    <div class="voice-card" onclick="testVoice('{{ voice.id }}')">
+                        <div class="voice-name">{{ voice.name }}</div>
+                        <div class="voice-category">{{ voice.category }}</div>
+                        <div class="voice-description">{{ voice.description }}</div>
+                        <button type="button" class="btn" style="margin-top: 10px; padding: 8px 15px; font-size: 14px;">
+                            Test Voice
+                        </button>
                     </div>
                     {% endfor %}
                 </div>
+            </div>
+            
+            <!-- Voice Cloning Tab -->
+            <div id="clone-tab" class="tab-content">
+                <h3>Voice Cloning</h3>
+                <p style="margin-bottom: 20px; color: #666;">Upload an audio sample to create a custom voice clone using ElevenLabs AI.</p>
                 
-                <div style="margin-top: 30px;">
-                    <h3>Voice Upload (Coming Soon)</h3>
-                    <p>Custom voice training and cloning features will be available in the next update.</p>
+                <form id="clone-form" onsubmit="cloneVoice(event)">
+                    <div class="form-group">
+                        <label for="voice-name">Voice Name:</label>
+                        <input type="text" id="voice-name" name="voice_name" class="form-control" 
+                               placeholder="Enter a name for your cloned voice" required>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label for="voice-description">Description (Optional):</label>
+                        <input type="text" id="voice-description" name="voice_description" class="form-control" 
+                               placeholder="Describe the voice characteristics">
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>Upload Voice Sample:</label>
+                        <div class="upload-area" onclick="document.getElementById('clone-audio-file').click()">
+                            <p>Click to select audio file for voice cloning</p>
+                            <small>High-quality audio recommended (1-5 minutes, clear speech)</small>
+                            <input type="file" id="clone-audio-file" name="clone_audio_file" 
+                                   accept=".wav,.mp3,.ogg,.m4a,.flac" style="display: none;" 
+                                   onchange="handleCloneFileSelect(this)">
+                        </div>
+                        <div id="clone-file-info" class="file-info"></div>
+                    </div>
+                    
+                    <button type="submit" class="btn" id="clone-btn" disabled>Clone Voice</button>
+                </form>
+                
+                <div id="clone-loading" class="loading">
+                    <div class="spinner"></div>
+                    <p>Cloning voice with ElevenLabs AI...</p>
+                </div>
+                
+                <div id="clone-result" style="display: none;">
+                    <h3>Voice Cloning Result:</h3>
+                    <div id="clone-message" style="background: #f8f9fa; padding: 20px; border-radius: 10px; margin-top: 10px;"></div>
                 </div>
             </div>
         </div>
     </div>
     
     <script>
+        let selectedVoiceId = null;
+        
         // Tab switching
         function switchTab(tabName) {
             document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
@@ -567,16 +728,22 @@ HTML_TEMPLATE = """
             document.getElementById(tabName + '-tab').classList.add('active');
         }
         
+        // Voice selection
+        function selectVoice(voiceId, element) {
+            document.querySelectorAll('.voice-card').forEach(card => card.classList.remove('selected'));
+            element.classList.add('selected');
+            selectedVoiceId = voiceId;
+            document.getElementById('selected-voice').value = voiceId;
+        }
+        
         // Range input updates
-        document.getElementById('rate').oninput = function() {
-            document.getElementById('rate-value').textContent = this.value;
-        }
+        ['stability', 'similarity', 'style'].forEach(id => {
+            document.getElementById(id).oninput = function() {
+                document.getElementById(id + '-value').textContent = this.value;
+            }
+        });
         
-        document.getElementById('volume').oninput = function() {
-            document.getElementById('volume-value').textContent = Math.round(this.value * 100);
-        }
-        
-        // File handling
+        // File handling for STT
         function handleFileSelect(input) {
             const file = input.files[0];
             if (file) {
@@ -591,45 +758,29 @@ HTML_TEMPLATE = """
             }
         }
         
-        // Drag and drop
-        const uploadArea = document.querySelector('.upload-area');
-        ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
-            uploadArea.addEventListener(eventName, preventDefaults, false);
-        });
-        
-        function preventDefaults(e) {
-            e.preventDefault();
-            e.stopPropagation();
-        }
-        
-        ['dragenter', 'dragover'].forEach(eventName => {
-            uploadArea.addEventListener(eventName, highlight, false);
-        });
-        
-        ['dragleave', 'drop'].forEach(eventName => {
-            uploadArea.addEventListener(eventName, unhighlight, false);
-        });
-        
-        function highlight(e) {
-            uploadArea.classList.add('dragover');
-        }
-        
-        function unhighlight(e) {
-            uploadArea.classList.remove('dragover');
-        }
-        
-        uploadArea.addEventListener('drop', handleDrop, false);
-        
-        function handleDrop(e) {
-            const dt = e.dataTransfer;
-            const files = dt.files;
-            document.getElementById('audio-file').files = files;
-            handleFileSelect(document.getElementById('audio-file'));
+        // File handling for voice cloning
+        function handleCloneFileSelect(input) {
+            const file = input.files[0];
+            if (file) {
+                const fileInfo = document.getElementById('clone-file-info');
+                fileInfo.innerHTML = `
+                    <strong>Selected:</strong> ${file.name}<br>
+                    <strong>Size:</strong> ${(file.size / 1024 / 1024).toFixed(2)} MB<br>
+                    <strong>Type:</strong> ${file.type}
+                `;
+                fileInfo.style.display = 'block';
+                document.getElementById('clone-btn').disabled = false;
+            }
         }
         
         // TTS Form submission
         async function generateSpeech(event) {
             event.preventDefault();
+            
+            if (!selectedVoiceId) {
+                alert('Please select a voice first.');
+                return;
+            }
             
             const form = event.target;
             const formData = new FormData(form);
@@ -695,6 +846,55 @@ HTML_TEMPLATE = """
             document.getElementById('stt-loading').style.display = 'none';
         }
         
+        // Voice cloning form submission
+        async function cloneVoice(event) {
+            event.preventDefault();
+            
+            const form = event.target;
+            const formData = new FormData(form);
+            
+            document.getElementById('clone-loading').style.display = 'block';
+            document.getElementById('clone-result').style.display = 'none';
+            
+            try {
+                const response = await fetch('/clone_voice', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const result = await response.json();
+                
+                if (result.success) {
+                    document.getElementById('clone-message').innerHTML = `
+                        <strong>✅ Voice cloned successfully!</strong><br>
+                        <strong>Voice ID:</strong> ${result.voice_id}<br>
+                        <strong>Name:</strong> ${result.voice_name}<br>
+                        <em>You can now use this voice in the Text-to-Speech tab.</em>
+                    `;
+                    
+                    // Refresh the page to load the new voice
+                    setTimeout(() => {
+                        location.reload();
+                    }, 3000);
+                } else {
+                    document.getElementById('clone-message').innerHTML = `
+                        <strong>Voice cloning failed:</strong><br>
+                        ${result.error}
+                    `;
+                }
+                
+                document.getElementById('clone-result').style.display = 'block';
+            } catch (error) {
+                document.getElementById('clone-message').innerHTML = `
+                    <strong>Error:</strong><br>
+                    ${error.message}
+                `;
+                document.getElementById('clone-result').style.display = 'block';
+            }
+            
+            document.getElementById('clone-loading').style.display = 'none';
+        }
+        
         // Copy to clipboard
         function copyToClipboard() {
             const text = document.getElementById('transcribed-text').textContent;
@@ -705,7 +905,7 @@ HTML_TEMPLATE = """
         
         // Test voice
         function testVoice(voiceId) {
-            const testText = "Hello, this is a voice test. How does this sound?";
+            const testText = "Hello, this is a voice test using ElevenLabs AI. How does this sound?";
             
             fetch('/test_voice', {
                 method: 'POST',
@@ -727,6 +927,52 @@ HTML_TEMPLATE = """
                 }
             });
         }
+        
+        // Drag and drop functionality
+        const uploadAreas = document.querySelectorAll('.upload-area');
+        
+        uploadAreas.forEach(uploadArea => {
+            ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(eventName => {
+                uploadArea.addEventListener(eventName, preventDefaults, false);
+            });
+            
+            ['dragenter', 'dragover'].forEach(eventName => {
+                uploadArea.addEventListener(eventName, () => uploadArea.classList.add('dragover'), false);
+            });
+            
+            ['dragleave', 'drop'].forEach(eventName => {
+                uploadArea.addEventListener(eventName, () => uploadArea.classList.remove('dragover'), false);
+            });
+            
+            uploadArea.addEventListener('drop', handleDrop, false);
+        });
+        
+        function preventDefaults(e) {
+            e.preventDefault();
+            e.stopPropagation();
+        }
+        
+        function handleDrop(e) {
+            const dt = e.dataTransfer;
+            const files = dt.files;
+            
+            // Determine which upload area this is
+            if (e.target.closest('#stt-tab')) {
+                document.getElementById('audio-file').files = files;
+                handleFileSelect(document.getElementById('audio-file'));
+            } else if (e.target.closest('#clone-tab')) {
+                document.getElementById('clone-audio-file').files = files;
+                handleCloneFileSelect(document.getElementById('clone-audio-file'));
+            }
+        }
+        
+        // Auto-select first voice if available
+        document.addEventListener('DOMContentLoaded', function() {
+            const firstVoice = document.querySelector('.voice-card');
+            if (firstVoice) {
+                firstVoice.click();
+            }
+        });
     </script>
 </body>
 </html>
@@ -734,29 +980,30 @@ HTML_TEMPLATE = """
 
 @app.route('/')
 def index():
-    system_voices = tts_engine.get_system_voices()
+    elevenlabs_voices = tts_engine.get_elevenlabs_voices()
+    api_connected = len(elevenlabs_voices) > 0
+    
     return render_template_string(HTML_TEMPLATE, 
-                                languages=SUPPORTED_LANGUAGES,
-                                system_voices=system_voices)
+                                elevenlabs_voices=elevenlabs_voices,
+                                api_connected=api_connected,
+                                voice_count=len(elevenlabs_voices))
 
 @app.route('/generate_speech', methods=['POST'])
 def generate_speech():
     try:
         text = request.form.get('text', '').strip()
-        language = request.form.get('language', 'en')
-        engine = request.form.get('engine', 'gtts')
-        voice_id = request.form.get('voice')
-        rate = int(request.form.get('rate', 200))
-        volume = float(request.form.get('volume', 0.9))
+        voice_id = request.form.get('voice_id', '')
+        stability = float(request.form.get('stability', 0.5))
+        similarity = float(request.form.get('similarity', 0.5))
+        style = float(request.form.get('style', 0.0))
         
         if not text:
             return jsonify({'success': False, 'error': 'No text provided'})
         
-        if engine == 'gtts':
-            filepath = tts_engine.text_to_speech_gtts(text, language)
-        else:
-            voice_id = int(voice_id) if voice_id else None
-            filepath = tts_engine.text_to_speech_pyttsx(text, voice_id, rate, volume)
+        if not voice_id:
+            return jsonify({'success': False, 'error': 'No voice selected'})
+        
+        filepath = tts_engine.text_to_speech_elevenlabs(text, voice_id, stability, similarity, style)
         
         if filepath and os.path.exists(filepath):
             filename = os.path.basename(filepath)
@@ -803,16 +1050,70 @@ def speech_to_text():
 def test_voice():
     try:
         data = request.get_json()
-        text = data.get('text', 'Test voice')
-        voice_id = data.get('voice_id', 0)
+        text = data.get('text', 'Test voice with ElevenLabs AI')
+        voice_id = data.get('voice_id', '')
         
-        filepath = tts_engine.text_to_speech_pyttsx(text, voice_id)
+        if not voice_id:
+            return jsonify({'success': False, 'error': 'No voice ID provided'})
+        
+        filepath = tts_engine.text_to_speech_elevenlabs(text, voice_id)
         
         if filepath and os.path.exists(filepath):
             filename = os.path.basename(filepath)
             return jsonify({'success': True, 'filename': filename})
         else:
             return jsonify({'success': False, 'error': 'Failed to generate test audio'})
+            
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/clone_voice', methods=['POST'])
+def clone_voice():
+    try:
+        if 'clone_audio_file' not in request.files:
+            return jsonify({'success': False, 'error': 'No audio file provided'})
+        
+        file = request.files['clone_audio_file']
+        voice_name = request.form.get('voice_name', '').strip()
+        voice_description = request.form.get('voice_description', '').strip()
+        
+        if file.filename == '':
+            return jsonify({'success': False, 'error': 'No file selected'})
+        
+        if not voice_name:
+            return jsonify({'success': False, 'error': 'Voice name is required'})
+        
+        if file and allowed_file(file.filename):
+            filename = secure_filename(file.filename)
+            unique_filename = f"{uuid.uuid4().hex[:8]}_{filename}"
+            filepath = os.path.join(app.config['UPLOAD_FOLDER'], unique_filename)
+            file.save(filepath)
+            
+            # Convert to MP3 if needed (ElevenLabs prefers MP3)
+            if not filepath.endswith('.mp3'):
+                audio = AudioSegment.from_file(filepath)
+                mp3_path = filepath.rsplit('.', 1)[0] + '.mp3'
+                audio.export(mp3_path, format="mp3")
+                os.remove(filepath)
+                filepath = mp3_path
+            
+            # Clone voice using ElevenLabs
+            voice_id = tts_engine.clone_voice_from_audio(filepath, voice_name, voice_description)
+            
+            # Clean up uploaded file
+            os.remove(filepath)
+            
+            if voice_id:
+                return jsonify({
+                    'success': True, 
+                    'voice_id': voice_id,
+                    'voice_name': voice_name,
+                    'message': 'Voice cloned successfully!'
+                })
+            else:
+                return jsonify({'success': False, 'error': 'Voice cloning failed'})
+        else:
+            return jsonify({'success': False, 'error': 'Invalid file type'})
             
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
@@ -852,21 +1153,32 @@ cleanup_thread.start()
 
 if __name__ == '__main__':
     print("\n" + "="*50)
-    print("🎤 VOICE STUDIO - TEXT-TO-SPEECH APPLICATION")
+    print("🎤 VOICE STUDIO - ELEVENLABS EDITION")
     print("="*50)
     print("✅ Features Available:")
-    print("   • Text-to-Speech (Google TTS + System voices)")
+    print("   • Text-to-Speech (ElevenLabs AI)")
     print("   • Speech-to-Text recognition")
-    print("   • Multiple European languages")
-    print("   • Voice testing and management")
+    print("   • Voice cloning with ElevenLabs")
+    print("   • Professional voice library")
+    print("   • Advanced voice settings")
     print("   • Web interface with drag & drop")
     print("   • Audio download functionality")
+    
+    if ELEVENLABS_API_KEY:
+        voices = tts_engine.get_elevenlabs_voices()
+        print(f"\n🎯 ElevenLabs API: Connected ({len(voices)} voices)")
+    else:
+        print("\n⚠️  ElevenLabs API: Not configured")
+        print("   Set ELEVENLABS_API_KEY environment variable")
+    
+    print(f"\n🌐 Platform: {platform.system()}")
     print("\n📋 Installation Requirements:")
-    print("   pip install flask gtts pyttsx3 speechrecognition pydub")
-    print("   pip install pyaudio")  # For microphone input
+    print("   pip install flask speechrecognition pydub requests")
     print("\n🚀 Starting server...")
     print("   Open http://localhost:5000 in your browser")
     print("="*50)
     
+    # Get port from environment (for cloud deployment)
+    port = int(os.environ.get('PORT', 5000))
     # Run the Flask application
-    app.run(debug=True, host='0.0.0.0', port=5000)
+    app.run(debug=False, host='0.0.0.0', port=port)
