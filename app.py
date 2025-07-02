@@ -9,7 +9,6 @@ import os
 import tempfile
 import uuid
 from werkzeug.utils import secure_filename
-import pyttsx3
 from gtts import gTTS
 import speech_recognition as sr
 from pydub import AudioSegment
