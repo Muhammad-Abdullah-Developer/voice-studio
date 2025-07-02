@@ -1,0 +1,8 @@
+# Ignore Python virtual environment
+venv
+
+__pycache__
+
+# Ignore uploaded files
+uploads
+output
