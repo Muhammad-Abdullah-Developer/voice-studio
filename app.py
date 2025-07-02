@@ -18,6 +18,7 @@ import base64
 import threading
 import time
 from datetime import datetime
+import platform
 
 app = Flask(__name__)
 app.secret_key = 'your-secret-key-change-this'
@@ -64,26 +65,58 @@ ALLOWED_EXTENSIONS = {'wav', 'mp3', 'ogg', 'm4a', 'flac'}
 
 def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+# Check if running on cloud platform
+IS_CLOUD_DEPLOYMENT = os.environ.get('RENDER') or os.environ.get('HEROKU') or platform.system() == 'Linux'
+
+# Conditional import for pyttsx3
+try:
+    if not IS_CLOUD_DEPLOYMENT:
+        import pyttsx3
+        PYTTSX_AVAILABLE = True
+    else:
+        PYTTSX_AVAILABLE = False
+        print("Running on cloud platform - pyttsx3 disabled, using Google TTS only")
+except ImportError:
+    PYTTSX_AVAILABLE = False
+    print("pyttsx3 not available - using Google TTS only")
 
 class TTSEngine:
     def __init__(self):
-        self.pyttsx_engine = pyttsx3.init()
+        if PYTTSX_AVAILABLE:
+            try:
+                self.pyttsx_engine = pyttsx3.init()
+            except:
+                self.pyttsx_engine = None
+                print("Failed to initialize pyttsx3 engine")
+        else:
+            self.pyttsx_engine = None
         self.custom_voices = {}
         
     def get_system_voices(self):
         """Get available system voices"""
-        voices = self.pyttsx_engine.getProperty('voices')
-        voice_list = []
-        for i, voice in enumerate(voices):
-            voice_list.append({
-                'id': i,
-                'name': voice.name,
-                'lang': getattr(voice, 'lang', 'unknown')
-            })
-        return voice_list
+        if not PYTTSX_AVAILABLE or not self.pyttsx_engine:
+            return [{'id': 0, 'name': 'Cloud TTS Only', 'lang': 'multiple'}]
+        
+        try:
+            voices = self.pyttsx_engine.getProperty('voices')
+            voice_list = []
+            for i, voice in enumerate(voices):
+                voice_list.append({
+                    'id': i,
+                    'name': voice.name,
+                    'lang': getattr(voice, 'lang', 'unknown')
+                })
+            return voice_list
+        except:
+            return [{'id': 0, 'name': 'System TTS Unavailable', 'lang': 'error'}]
     
     def text_to_speech_pyttsx(self, text, voice_id=None, rate=200, volume=0.9):
-        """Generate speech using pyttsx3"""
+        """Generate speech using pyttsx3 - fallback to gTTS on cloud"""
+        if not PYTTSX_AVAILABLE or not self.pyttsx_engine:
+            # Fallback to Google TTS
+            print("pyttsx3 not available, falling back to Google TTS")
+            return self.text_to_speech_gtts(text, 'en', False)
+        
         try:
             if voice_id is not None:
                 voices = self.pyttsx_engine.getProperty('voices')
@@ -102,9 +135,9 @@ class TTSEngine:
             
             return filepath
         except Exception as e:
-            print(f"Error in pyttsx TTS: {e}")
-            return None
-    
+            print(f"Error in pyttsx TTS: {e}, falling back to Google TTS")
+            return self.text_to_speech_gtts(text, 'en', False)
+        
     def text_to_speech_gtts(self, text, lang='en', slow=False):
         """Generate speech using Google TTS"""
         try:
